@@ -21,29 +21,18 @@ class GenerateState:
         self.tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
         self.processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
 
-        self.semaphore = asyncio.Semaphore(
+        self.generate_fn_semaphore = asyncio.Semaphore(
             args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
         )
-        self.sampling_params: dict[str, Any] = dict(
+        self.sampling_params: dict[str, Any] = compute_sampling_params(
+            args,
             temperature=args.rollout_temperature,
             top_p=args.rollout_top_p,
             top_k=args.rollout_top_k,
             max_new_tokens=args.rollout_max_response_len,
-            stop=args.rollout_stop,
-            stop_token_ids=args.rollout_stop_token_ids,
-            skip_special_tokens=args.rollout_skip_special_tokens,
-            no_stop_trim=True,
-            spaces_between_special_tokens=False,
         )
 
-        if getattr(args, "sglang_enable_deterministic_inference", False):
-            sampling_seed_base = args.rollout_seed
-            self.group_sampling_seeds = [sampling_seed_base + i for i in range(args.n_samples_per_prompt)]
-
-        if args.custom_generate_function_path is not None:
-            self.generate_function = load_generate_function(args.custom_generate_function_path)
-        else:
-            self.generate_function = generate
+        self.generate_function = load_generate_function(args.custom_generate_function_path) or generate
 
         self.reset()
 
@@ -71,7 +60,7 @@ async def generate_and_rm(
         return sample
 
     # generate
-    async with state.semaphore:
+    async with state.generate_fn_semaphore:
         if state.aborted:
             sample.status = Sample.Status.ABORTED
             return sample
@@ -84,12 +73,14 @@ async def generate_and_rm(
                 evaluation=evaluation,
             )
         )
-        sample = output.sample
+        sample = output.samples
 
+    # TODO change to `if not args.group_rm: do reward model` for more clarity after the refactor below
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
         return sample
 
+    # TODO: unify the two branches into one if we decide to use list as output type
     # multi samples
     if isinstance(sample, list):
         samples = sample
@@ -98,9 +89,7 @@ async def generate_and_rm(
 
         # for multi agent system, the reward of some sample is calculated during generation.
         samples_need_reward = [sample for sample in samples if sample.reward is None]
-        rewards = await batched_async_rm(args, samples_need_reward)
-        for sample, reward in zip(samples_need_reward, rewards, strict=False):
-            sample.reward = reward
+        await batched_async_rm(args, samples_need_reward, inplace_set_reward_field=True)
         return samples
     else:
         if sample.status == Sample.Status.ABORTED:
@@ -124,18 +113,38 @@ async def generate_and_rm_group(
     for idx, sample in enumerate(group):
         current_sampling_params = sampling_params.copy()
         if getattr(args, "sglang_enable_deterministic_inference", False):
-            seed = state.group_sampling_seeds[idx]
-            current_sampling_params["sampling_seed"] = seed
+            current_sampling_params["sampling_seed"] = args.rollout_seed + idx
         tasks.append(
             asyncio.create_task(generate_and_rm(state, sample, current_sampling_params, evaluation=evaluation))
         )
 
     group = await asyncio.gather(*tasks)
+    if state.aborted:
+        return group
 
-    # for the rm that need the whole group, we will do the rm here
-    if not state.aborted and args.group_rm:
-        rewards = await batched_async_rm(args, group)
-        for sample, reward in zip(group, rewards, strict=False):
-            sample.reward = reward
+    if args.group_rm:
+        await batched_async_rm(args, group, inplace_set_reward_field=True)
 
     return group
+
+
+def compute_sampling_params(
+    args,
+    *,
+    # after unifying configuration, this can be further refactored
+    temperature,
+    top_p,
+    top_k,
+    max_new_tokens,
+):
+    return dict(
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        max_new_tokens=max_new_tokens,
+        stop=args.rollout_stop,
+        stop_token_ids=args.rollout_stop_token_ids,
+        skip_special_tokens=args.rollout_skip_special_tokens,
+        no_stop_trim=True,
+        spaces_between_special_tokens=False,
+    )

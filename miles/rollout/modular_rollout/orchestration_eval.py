@@ -6,9 +6,10 @@ from typing import Any
 from tqdm import tqdm
 
 from miles.rollout.base_types import RolloutFnConstructorInput, RolloutFnEvalInput, RolloutFnEvalOutput
-from miles.rollout.modular_rollout.orchestration_common import GenerateState, generate_and_rm
+from miles.rollout.modular_rollout.orchestration_common import GenerateState, compute_sampling_params, generate_and_rm
 from miles.utils.data import Dataset
 from miles.utils.eval_config import EvalDatasetConfig
+from miles.utils.misc import as_completed_async
 from miles.utils.processing_utils import load_processor, load_tokenizer
 from miles.utils.types import Sample
 
@@ -42,16 +43,12 @@ async def eval_rollout_single_dataset(
         )
     dataset = prompt_dataset_cache[cache_key]
 
-    base_sampling_params = dict(
+    base_sampling_params = compute_sampling_params(
+        args,
         temperature=dataset_cfg.temperature,
         top_p=dataset_cfg.top_p,
         top_k=dataset_cfg.top_k,
         max_new_tokens=dataset_cfg.max_response_len,
-        stop=args.rollout_stop,
-        stop_token_ids=args.rollout_stop_token_ids,
-        skip_special_tokens=args.rollout_skip_special_tokens,
-        no_stop_trim=True,
-        spaces_between_special_tokens=False,
     )
 
     tasks = []
@@ -82,8 +79,7 @@ async def eval_rollout_single_dataset(
     data = []
     do_print = True
     pbar = tqdm(total=len(tasks), desc=f"Eval {dataset_cfg.name}", disable=not do_print)
-    for coro in asyncio.as_completed(tasks):
-        sample = await coro
+    async for sample in as_completed_async(tasks):
         if do_print:
             logger.info(
                 "eval_rollout_single_dataset example data: "
@@ -112,18 +108,15 @@ async def eval_rollout_single_dataset(
 
 class SimpleEvalRolloutFn:
     def __init__(self, input: RolloutFnConstructorInput):
-        self.args = input.args
         self.prompt_dataset_cache = {}
-        self.state = GenerateState(self.args)
+        self.state = GenerateState(input.args)
 
     async def __call__(self, input: RolloutFnEvalInput) -> RolloutFnEvalOutput:
-        assert not self.args.group_rm, "Group RM is not supported for eval rollout"
+        assert not self.state.args.group_rm, "Group RM is not supported for eval rollout"
 
         coros = []
-        for dataset_cfg in getattr(self.args, "eval_datasets", []) or []:
+        for dataset_cfg in getattr(self.state.args, "eval_datasets", []) or []:
             coros.append(eval_rollout_single_dataset(self.state, dataset_cfg, self.prompt_dataset_cache))
         results_list = await asyncio.gather(*coros)
-        results = {}
-        for r in results_list:
-            results.update(r)
+        results = {k: v for r in results_list for k, v in r.items()}
         return RolloutFnEvalOutput(data=results)

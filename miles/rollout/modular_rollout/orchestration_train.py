@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from argparse import Namespace
 from collections.abc import Callable
 
 import sglang_router
@@ -10,7 +11,7 @@ from miles.rollout.base_types import RolloutFnConstructorInput, RolloutFnTrainIn
 from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
 from miles.rollout.modular_rollout.orchestration_common import GenerateState, generate_and_rm_group
 from miles.utils.http_utils import get, post
-from miles.utils.misc import load_function
+from miles.utils.misc import as_completed_async, load_function
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
@@ -19,42 +20,38 @@ logger = logging.getLogger(__name__)
 async def abort(state: GenerateState, pendings: set, rollout_id: int) -> list[list[Sample]]:
     args = state.args
 
-    aborted_samples = []
-
     assert not state.aborted
     state.aborted = True
 
-    if parse(sglang_router.__version__) <= parse("0.2.1") or args.use_miles_router:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
-        urls = response["urls"]
-    else:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
-        urls = [worker["url"] for worker in response["workers"]]
-
+    urls = await get_worker_urls(args)
     logger.info(f"Abort request for {urls}")
     await asyncio.gather(*[post(f"{url}/abort_request", {"abort_all": True}) for url in urls])
 
     # make sure all the pending tasks are finished
-    count = 0
-    while pendings:
-        done, pendings = await asyncio.wait(pendings, return_when=asyncio.FIRST_COMPLETED)
-
+    aborted_samples = []
+    async for group in as_completed_async(pendings):
         if not args.partial_rollout:
             continue
 
         # for partial rollout, collect the partial samples into the data buffer
-        for task in done:
-            group = task.result()
-            for sample in group:
-                if sample.response and "start_rollout_id" not in sample.metadata:
-                    sample.metadata["start_rollout_id"] = rollout_id
-            aborted_samples.append(group)
-            count += len(group)
+        for sample in group:
+            if sample.response and "start_rollout_id" not in sample.metadata:
+                sample.metadata["start_rollout_id"] = rollout_id
+        aborted_samples.append(group)
 
     if args.partial_rollout:
-        logger.info(f"Collected {count} partial samples into the data buffer")
+        logger.info(f"Collected {sum(len(x) for x in aborted_samples)} partial samples into the data buffer")
 
     return aborted_samples
+
+
+async def get_worker_urls(args: Namespace):
+    if parse(sglang_router.__version__) <= parse("0.2.1") or args.use_miles_router:
+        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
+        return response["urls"]
+    else:
+        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
+        return [worker["url"] for worker in response["workers"]]
 
 
 def submit_generate_tasks(state: GenerateState, samples: list[list[Sample]]):
@@ -79,9 +76,7 @@ async def generate_rollout_async(
     assert args.rollout_global_dataset
 
     # instantiate data filters
-    dynamic_filter = (
-        load_function(args.dynamic_sampling_filter_path) if args.dynamic_sampling_filter_path is not None else None
-    )
+    dynamic_filter = load_function(args.dynamic_sampling_filter_path)
 
     metric_gatherer = MetricGatherer()
 
@@ -97,7 +92,7 @@ async def generate_rollout_async(
         while len(data) + len(pendings) < target_data_size:
             # get samples from the buffer and submit the generation requests.
             samples = data_source(args.over_sampling_batch_size)
-            pendings |= submit_generate_tasks(state, samples)
+            pendings.update(submit_generate_tasks(state, samples))
 
         # wait for the generation to finish
         done, pendings = await asyncio.wait(pendings, return_when=asyncio.FIRST_COMPLETED)
@@ -141,23 +136,20 @@ async def generate_rollout_async(
 
     # reset the global state to prevent effects on the next rollout or eval.
     state.reset()
-    if args.rollout_sample_filter_path is not None:
-        filter_func = load_function(args.rollout_sample_filter_path)
-        filter_func(args, data)
 
+    if f := load_function(args.rollout_sample_filter_path):
+        f(args, data)
     # There can be circumstances where users want to process all samples including filtered ones.
-    if args.rollout_all_samples_process_path is not None:
-        process_func = load_function(args.rollout_all_samples_process_path)
-        process_func(args, all_samples, data_source)
+    if f := load_function(args.rollout_all_samples_process_path):
+        f(args, all_samples, data_source)
 
     return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect()), aborted_samples
 
 
 class SimpleTrainRolloutFn:
     def __init__(self, input: RolloutFnConstructorInput):
-        self.args = input.args
         self.data_source = input.data_source
-        self.state = GenerateState(self.args)
+        self.state = GenerateState(input.args)
 
     async def __call__(self, input: RolloutFnTrainInput) -> RolloutFnTrainOutput:
         output, aborted_samples = await generate_rollout_async(

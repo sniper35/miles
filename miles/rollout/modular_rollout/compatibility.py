@@ -64,13 +64,15 @@ class LegacyGenerateFnAdapter:
             output = await self.fn(input.args, input.sample, input.sampling_params)
 
         if not isinstance(output, GenerateFnOutput):
-            output = GenerateFnOutput(sample=output)
+            output = GenerateFnOutput(samples=output)
 
         return output
 
 
 def load_generate_function(path: str):
     fn = load_function(path)
+    if fn is None:
+        return None
 
     if inspect.isclass(fn):
         return fn()
