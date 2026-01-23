@@ -414,6 +414,32 @@ class TestRespectMaxContextLen:
             ]
         verify_samples(result.sample, expected)
 
+    @pytest.mark.parametrize(
+        "generation_env,expected_max_new_tokens",
+        [
+            (
+                {"args_kwargs": {"rollout_max_context_len": len(TwoTurnStub.SECOND_PROMPT_TOKEN_IDS) + 10}},
+                10,
+            ),
+            (
+                {"args_kwargs": {"rollout_max_context_len": len(TwoTurnStub.SECOND_PROMPT_TOKEN_IDS) + 100}},
+                64,
+            ),
+        ],
+        indirect=["generation_env"],
+    )
+    def test_second_turn_adjusts_max_new_tokens(self, variant, generation_env, expected_max_new_tokens):
+        if is_agentic_variant(variant):
+            pytest.skip("TODO: implement")
+        S = TwoTurnStub
+        generation_env.mock_server.process_fn = S.process_fn
+
+        result = _run_generate(variant, generation_env, make_sample(prompt=S.PROMPT))
+
+        assert len(result.requests) >= 2
+        assert result.requests[1]["sampling_params"]["max_new_tokens"] == expected_max_new_tokens
+        assert result.requests[1]["sampling_params"]["temperature"] == DEFAULT_SAMPLING_PARAMS["temperature"]
+
 
 class TestThreeTurn:
     """Need to test 3-turn case besides 2-turn, because e.g. merge_samples may behave differently."""

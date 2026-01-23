@@ -330,6 +330,50 @@ class TestBoundaryConditions:
             )
         ]
 
+    @pytest.mark.parametrize(
+        "generation_env,expected_max_new_tokens",
+        [
+            ({"args_kwargs": {"rollout_max_context_len": 10}}, 10 - PROMPT_TOKEN_LEN),
+            ({"args_kwargs": {"rollout_max_context_len": 8}}, 8 - PROMPT_TOKEN_LEN),
+            ({"args_kwargs": {"rollout_max_context_len": 100}}, DEFAULT_MAX_NEW_TOKENS),
+        ],
+        indirect=["generation_env"],
+    )
+    def test_moderate_length_input_adjusts_max_new_tokens(self, variant, generation_env, expected_max_new_tokens):
+        if variant == "old_sglang_rollout":
+            pytest.skip("old_sglang_rollout does not support rollout_max_context_len")
+        result = _run_generate(variant, generation_env)
+        assert len(result.requests) == 1
+        assert result.requests[0]["sampling_params"]["max_new_tokens"] == expected_max_new_tokens
+        assert result.requests[0]["sampling_params"]["temperature"] == SAMPLING_PARAMS["temperature"]
+        assert listify(result.sample) == [expected_sample(variant)]
+
+    @pytest.mark.parametrize(
+        "generation_env",
+        [{"args_kwargs": {"rollout_max_context_len": PROMPT_TOKEN_LEN}}],
+        indirect=True,
+    )
+    def test_adjusted_max_new_tokens_zero_returns_truncated(self, variant, generation_env):
+        if variant == "old_sglang_rollout":
+            pytest.skip("old_sglang_rollout does not support rollout_max_context_len")
+        if variant == "multi_turn_multi_samples":
+            pytest.skip("multi_turn_multi_samples returns empty list when first turn fails")
+        result = _run_generate(variant, generation_env)
+        assert result.requests == []
+        tokens = PROMPT_TOKENS if variant == "multi_turn_single_sample" else []
+        assert listify(result.sample) == [
+            expected_sample(
+                variant,
+                response="",
+                response_length=0,
+                tokens=tokens,
+                rollout_log_probs=None,
+                status=Sample.Status.TRUNCATED,
+                prompt_tokens=0,
+                loss_mask=None if variant == "multi_turn_single_sample" else _UNSET,
+            )
+        ]
+
 
 class TestEmptyResponse:
     @pytest.mark.parametrize("generation_env", [{"process_fn_kwargs": {"response_text": ""}}], indirect=True)
