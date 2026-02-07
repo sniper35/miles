@@ -4,6 +4,27 @@ Run no-router and router benchmarks into a separate output root, then compare.
 
 This avoids overwriting existing outputs/ folders by default:
   outputs/router_eval_<YYYYmmdd_HHMMSS>/
+
+usage:
+
+  MODEL="${MODEL:-stabilityai/stable-diffusion-3-medium-diffusers}"
+
+  for g in 8; do
+    for k in 3; do
+      c=$((k*g))
+      p=$((80*c))
+      python examples/diffusion_router/run_router_vs_no_router_matrix.py \
+        --model "$MODEL" \
+        --gpu-counts $g \
+        --configs ${p}x${c} \
+        --output-root outputs/router_eval_k${k}_g${g} \
+        --no-router-worker-base-port $((41000 + 500*g + 20*k)) \
+        --router-worker-base-port $((11090 + 500*g + 20*k)) \
+        --no-router-bench-status-interval 20 \
+        --no-router-bench-shard-timeout 7200 \
+        --continue-on-error
+    done
+  done
 """
 
 from __future__ import annotations
