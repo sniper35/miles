@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import logging
+import random
 
 import httpx
 import uvicorn
@@ -33,6 +34,9 @@ class DiffusionRouter:
         self.worker_failure_counts: dict[str, int] = {}
         # Quarantined workers excluded from routing pool
         self.dead_workers: set[str] = set()
+
+        self.routing_algorithm = getattr(args, "routing_algorithm", "least-request")
+        self._rr_index = 0
 
         max_connections = getattr(args, "max_connections", 100)
         timeout = getattr(args, "timeout", None)
@@ -112,15 +116,21 @@ class DiffusionRouter:
     # ── Load balancing ───────────────────────────────────────────────
 
     def _use_url(self):
-        """Select worker URL with minimal active requests."""
+        """Select a worker URL based on the configured routing algorithm."""
         if not self.worker_request_counts:
             raise RuntimeError("No workers registered in the pool")
 
-        valid_workers = (w for w in self.worker_request_counts if w not in self.dead_workers)
-        try:
+        valid_workers = [w for w in self.worker_request_counts if w not in self.dead_workers]
+        if not valid_workers:
+            raise RuntimeError("No healthy workers available in the pool")
+
+        if self.routing_algorithm == "round-robin":
+            url = valid_workers[self._rr_index % len(valid_workers)]
+            self._rr_index = (self._rr_index + 1) % len(valid_workers)
+        elif self.routing_algorithm == "random":
+            url = random.choice(valid_workers)
+        else:  # least-request (default)
             url = min(valid_workers, key=self.worker_request_counts.get)
-        except ValueError:
-            raise RuntimeError("No healthy workers available in the pool") from None
 
         self.worker_request_counts[url] += 1
         return url
@@ -159,7 +169,7 @@ class DiffusionRouter:
         return Response(content=content, status_code=status_code, headers=headers, media_type=content_type)
 
     async def _forward_to_worker(self, request: Request, path: str) -> Response:
-        """Forward a request to the least-loaded worker and return the response."""
+        """Forward a request to a selected worker and return the response."""
         try:
             worker_url = self._use_url()
         except RuntimeError as exc:
@@ -291,6 +301,8 @@ if __name__ == "__main__":
     parser.add_argument("--timeout", type=float, default=None)
     parser.add_argument("--health-check-interval", type=int, default=10)
     parser.add_argument("--health-check-failure-threshold", type=int, default=3)
+    parser.add_argument("--routing-algorithm", type=str, default="least-request",
+                        choices=["least-request", "round-robin", "random"])
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 

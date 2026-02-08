@@ -220,6 +220,9 @@ def main() -> int:
 
     parser.add_argument("--router-host", type=str, default="127.0.0.1", help="Router bind host.")
     parser.add_argument("--router-port", type=int, default=30080, help="Router port.")
+    parser.add_argument("--routing-algorithm", type=str, default="least-request",
+                        choices=["least-request", "round-robin", "random"],
+                        help="Load-balancing algorithm for the router.")
     parser.add_argument("--router-verbose", action="store_true", help="Enable router verbose logging.")
     parser.add_argument("--router-extra-args", type=str, default="", help="Extra args for the router demo script.")
 
@@ -427,6 +430,8 @@ def main() -> int:
             "--worker-urls",
             *worker_urls,
         ]
+        if args.routing_algorithm:
+            router_cmd += ["--routing-algorithm", args.routing_algorithm]
         if args.router_verbose:
             router_cmd.append("--verbose")
         if args.router_extra_args:
