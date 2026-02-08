@@ -28,7 +28,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from statistics import mean
+from statistics import mean, median
 
 import requests
 
@@ -367,12 +367,12 @@ def main() -> int:
     else:
         try:
             import sglang  # noqa: F401
-        except ImportError:
+        except ImportError as e:
             raise RuntimeError(
                 "sglang is not installed and no source repo found at ../sglang.\n"
                 "Install with: uv pip install \"sglang[diffusion]\" --prerelease=allow\n"
                 "Or point to the source repo with: --sglang-root /path/to/sglang"
-            )
+            ) from e
         env = dict(os.environ)
 
     output_dir = Path(args.output_dir)
@@ -438,12 +438,12 @@ def main() -> int:
         worker_log_files: list[object] = []
         workers: list[subprocess.Popen] = []
         try:
-            for i, (url, port, gpu_group) in enumerate(zip(worker_urls, worker_ports, worker_gpu_groups)):
+            for i, (url, port, gpu_group) in enumerate(zip(worker_urls, worker_ports, worker_gpu_groups, strict=True)):
                 master_port, scheduler_port = worker_internal_ports[i]
                 worker_env = dict(env)
                 worker_env["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_group)
                 print(
-                    f"[no-router] Launching worker {i} on port {port} "
+                    f"[no-router] Launching worker {i} at {url} "
                     f"(master={master_port}, scheduler={scheduler_port}) "
                     f"with CUDA_VISIBLE_DEVICES={worker_env['CUDA_VISIBLE_DEVICES']}",
                     flush=True,
@@ -493,13 +493,37 @@ def main() -> int:
 
                 prompt_splits, conc_splits = _build_shards(worker_count, num_prompts, max_concurrency)
 
-                bench_jobs: list[dict[str, object]] = []
-                for i, (url, prompts_i, conc_i) in enumerate(zip(worker_urls, prompt_splits, conc_splits)):
-                    if prompts_i <= 0 or conc_i <= 0:
-                        continue
+                active_shards = [
+                    (i, url, prompts_i, conc_i)
+                    for i, (url, prompts_i, conc_i) in enumerate(zip(worker_urls, prompt_splits, conc_splits, strict=True))
+                    if prompts_i > 0 and conc_i > 0
+                ]
+                if not active_shards:
+                    raise RuntimeError(
+                        "No active shards were created. "
+                        f"worker_count={worker_count}, num_prompts={num_prompts}, max_concurrency={max_concurrency}"
+                    )
 
+                # If request-rate is finite, split it across shard clients so the total offered
+                # rate stays comparable to the router case (single client).
+                # Allocate proportionally to each shard's max_concurrency share.
+                if args.request_rate != float("inf"):
+                    total_conc = sum(conc_i for _, _, _, conc_i in active_shards)
+                    if total_conc <= 0:
+                        per_shard_request_rates = {i: float("inf") for i, *_ in active_shards}
+                    else:
+                        per_shard_request_rates = {
+                            i: float(args.request_rate) * float(conc_i) / float(total_conc)
+                            for i, _, _, conc_i in active_shards
+                        }
+                else:
+                    per_shard_request_rates = {i: float("inf") for i, *_ in active_shards}
+
+                bench_jobs: list[dict[str, object]] = []
+                for i, url, prompts_i, conc_i in active_shards:
                     out_file = output_dir / f"bench_g{total_gpus}_p{num_prompts}_c{max_concurrency}_shard{i}.json"
                     log_file = output_dir / f"bench_g{total_gpus}_p{num_prompts}_c{max_concurrency}_shard{i}.log"
+                    shard_request_rate = per_shard_request_rates.get(i, float(args.request_rate))
                     cmd = [
                         sys.executable,
                         "-m",
@@ -515,7 +539,7 @@ def main() -> int:
                         "--max-concurrency",
                         str(conc_i),
                         "--request-rate",
-                        str(args.request_rate),
+                        str(shard_request_rate),
                         "--log-level",
                         args.log_level,
                         "--output-file",
@@ -630,16 +654,22 @@ def main() -> int:
                 for job in bench_jobs:
                     out_file = job["out_file"]
                     assert isinstance(out_file, Path)
-                    with open(out_file, "r", encoding="utf-8") as f:
+                    with out_file.open(encoding="utf-8") as f:
                         shard_metrics.append(json.load(f))
 
                 completed = sum(int(m.get("completed_requests", 0)) for m in shard_metrics)
                 failed = sum(int(m.get("failed_requests", 0)) for m in shard_metrics)
                 durations = [float(m.get("duration", 0.0)) for m in shard_metrics]
+                duration_max_s = max(durations) if durations else 0.0
+                # NOTE: shards run in parallel; global throughput should be computed against wall-clock time.
+                throughput_qps = completed / duration_max_s if duration_max_s > 0 else 0.0
+                # Keep the sum for debugging, but don't use it as "global throughput".
                 throughput_sum = sum(float(m.get("throughput_qps", 0.0)) for m in shard_metrics)
                 peak_max = max((float(m.get("peak_memory_mb_max", 0.0)) for m in shard_metrics), default=0.0)
                 peak_mean = mean([float(m.get("peak_memory_mb_mean", 0.0)) for m in shard_metrics]) if shard_metrics else 0.0
-                peak_median = mean([float(m.get("peak_memory_mb_median", 0.0)) for m in shard_metrics]) if shard_metrics else 0.0
+                peak_medians = [float(m.get("peak_memory_mb_median", 0.0)) for m in shard_metrics]
+                peak_median = median(peak_medians) if peak_medians else 0.0
+                latency_mean = _weighted_latency_mean(shard_metrics)
 
                 aggregate = {
                     "model": args.model,
@@ -651,13 +681,19 @@ def main() -> int:
                     "max_concurrency": max_concurrency,
                     "completed_requests": completed,
                     "failed_requests": failed,
+                    "duration_s": duration_max_s,
                     "throughput_qps_sum": throughput_sum,
-                    "duration_max_s": max(durations) if durations else 0.0,
-                    "latency_mean_weighted_s": _weighted_latency_mean(shard_metrics),
+                    "duration_max_s": duration_max_s,
+                    "throughput_qps": throughput_qps,
+                    "latency_mean_weighted_s": latency_mean,
+                    # Align key name with bench_serving outputs for easier comparison.
+                    "latency_mean": latency_mean,
                     "peak_memory_mb_max": peak_max,
                     "peak_memory_mb_mean": peak_mean,
                     "peak_memory_mb_median": peak_median,
                     "worker_urls": worker_urls,
+                    "active_shards": len(active_shards),
+                    "request_rate_total": float(args.request_rate),
                 }
 
                 agg_file = output_dir / f"bench_g{total_gpus}_p{num_prompts}_c{max_concurrency}_aggregate.json"

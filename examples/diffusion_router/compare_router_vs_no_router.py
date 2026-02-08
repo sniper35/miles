@@ -36,14 +36,14 @@ class BenchPoint:
 def _safe_float(value: object, default: float = 0.0) -> float:
     try:
         return float(value)
-    except Exception:
+    except (TypeError, ValueError):
         return default
 
 
 def _safe_int(value: object, default: int = 0) -> int:
     try:
         return int(value)
-    except Exception:
+    except (TypeError, ValueError):
         return default
 
 
@@ -82,8 +82,10 @@ def _parse_no_router_file(path: Path) -> tuple[tuple[int, int, int], BenchPoint]
         gpus=g,
         prompts=p,
         concurrency=c,
-        throughput_qps=_safe_float(d.get("throughput_qps_sum", d.get("throughput_qps", 0.0))),
-        latency_mean_s=_safe_float(d.get("latency_mean_weighted_s", d.get("latency_mean", 0.0))),
+        # Prefer the corrected "global" throughput when present; fall back to legacy sum.
+        throughput_qps=_safe_float(d.get("throughput_qps", d.get("throughput_qps_sum", 0.0))),
+        # Prefer bench_serving-aligned key when present; fall back to legacy weighted key.
+        latency_mean_s=_safe_float(d.get("latency_mean", d.get("latency_mean_weighted_s", 0.0))),
         completed_requests=_safe_int(d.get("completed_requests", 0)),
         failed_requests=_safe_int(d.get("failed_requests", 0)),
         source_file=str(path),
