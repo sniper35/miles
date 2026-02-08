@@ -133,6 +133,31 @@ class DiffusionRouter:
 
     # ── Proxy helpers ────────────────────────────────────────────────
 
+    def _build_proxy_response(self, content: bytes, status_code: int, headers: dict) -> Response:
+        """
+        Build an HTTP response from proxied bytes.
+
+        Keep behavior consistent with `MilesRouter._build_proxy_response`:
+        - If the payload is JSON, return `JSONResponse`
+        - Otherwise, return raw `Response`
+
+        Diffusion responses (e.g. `b64_json`) can be very large; decoding and re-encoding
+        the JSON can dominate CPU time. We therefore skip JSON decoding for large bodies.
+        """
+        content_type = headers.get("content-type", "")
+
+        # Size guard: don't pay JSON decode/re-encode costs on large payloads.
+        # This preserves exact bytes on the wire and avoids CPU/memory pressure.
+        max_json_reencode_bytes = 256 * 1024
+        if len(content) <= max_json_reencode_bytes:
+            try:
+                data = json.loads(content)
+                return JSONResponse(content=data, status_code=status_code, headers=headers)
+            except Exception:
+                pass
+
+        return Response(content=content, status_code=status_code, headers=headers, media_type=content_type)
+
     async def _forward_to_worker(self, request: Request, path: str) -> Response:
         """Forward a request to the least-loaded worker and return the response."""
         try:
@@ -145,6 +170,9 @@ class DiffusionRouter:
         url = f"{worker_url}/{path}" if not query else f"{worker_url}/{path}?{query}"
         body = await request.body()
         headers = dict(request.headers)
+        # Let httpx set the correct framing headers for the forwarded body.
+        if body is not None:
+            headers = {k: v for k, v in headers.items() if k.lower() not in ("content-length", "transfer-encoding")}
 
         try:
             response = await self.client.request(request.method, url, content=body, headers=headers)
@@ -153,14 +181,7 @@ class DiffusionRouter:
             self._finish_url(worker_url)
 
         resp_headers = self._sanitize_response_headers(response.headers)
-        content_type = resp_headers.get("content-type", "")
-        try:
-            data = json.loads(content)
-            return JSONResponse(content=data, status_code=response.status_code, headers=resp_headers)
-        except Exception:
-            return Response(
-                content=content, status_code=response.status_code, headers=resp_headers, media_type=content_type
-            )
+        return self._build_proxy_response(content, response.status_code, resp_headers)
 
     async def _broadcast_to_workers(self, path: str, body: bytes, headers: dict) -> list[dict]:
         """Send a request to ALL healthy workers and collect results."""
@@ -193,8 +214,8 @@ class DiffusionRouter:
         return await self._forward_to_worker(request, "v1/images/generations")
 
     async def generate_video(self, request: Request):
-        """Route video generation to the least-loaded worker via /v1/videos/generations."""
-        return await self._forward_to_worker(request, "v1/videos/generations")
+        """Route video generation to the least-loaded worker via /v1/videos."""
+        return await self._forward_to_worker(request, "v1/videos")
 
     async def health(self, request: Request):
         """Aggregated health status: healthy if at least one worker is alive."""
